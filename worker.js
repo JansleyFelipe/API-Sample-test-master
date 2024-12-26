@@ -1,6 +1,7 @@
 const hubspot = require('@hubspot/api-client');
 const { queue } = require('async');
 const _ = require('lodash');
+const cron = require('node-cron');
 
 const { filterNullValuesFromObject, goal } = require('./utils');
 const Domain = require('./Domain');
@@ -287,6 +288,117 @@ const drainQueue = async (domain, actions, q) => {
   return true;
 };
 
+/**
+ * Fetch and process meetings from HubSpot
+ */
+const processMeetings = async (domain, hubId, q) => {
+  const account = domain.integrations.hubspot.accounts.find(acc => acc.hubId === hubId);
+
+  // Determine last pulled date or default to 2 years ago
+  const defaultPulledDate = new Date();
+  defaultPulledDate.setMonth(defaultPulledDate.getMonth() - 24);
+
+  const lastPulledDate = new Date(account.lastPulledDates.meetings || defaultPulledDate);
+
+  if (isNaN(lastPulledDate.getTime())) {
+    console.error('Invalid lastPulledDate:', lastPulledDate);
+    return;
+  }
+
+  const now = new Date();
+  const limit = 100;
+  let after = null;
+  let hasMore = true;
+
+  while (hasMore) {
+    try {
+      const filter = {
+        propertyName: 'hs_lastmodifieddate',
+        operator: 'GTE',
+        value: lastPulledDate
+      };
+
+      const { results: meetings, paging } = await hubspotClient.crm.objects.meetings.searchApi.doSearch({
+        filterGroups: [{ filters: [filter] }],
+        sorts: [{ propertyName: 'hs_lastmodifieddate', direction: 'ASCENDING' }],
+        properties: ['hs_meeting_title', 'createdate', 'hs_lastmodifieddate'],
+        limit,
+        after
+      });
+
+      for (const { id: meetingId, properties } of meetings) {
+        const { hs_meeting_title: title = 'No Title', hs_createdate: createDate, hs_lastmodifieddate: lastModified } = properties;
+        const isCreated = new Date(createDate) > lastPulledDate;
+        const action = isCreated ? 'Meeting Created' : 'Meeting Updated';
+
+        // Fetch associated contact emails
+        const attendeesEmails = await getMeetingAttendeesEmail(meetingId);
+
+        const actionTemplate = {
+          includeInAnalytics: 0,
+          meetingProperties: {
+            meeting_id: meetingId,
+            meeting_createDate: createDate,
+            meeting_lastModifiedDate: lastModified,
+            meeting_title: title,
+            meeting_attendees_email: attendeesEmails
+          }
+        };
+
+        q.push({
+          actionName: action,
+          actionDate: new Date(isCreated ? createDate : lastModified),
+          ...actionTemplate
+        });
+      }
+
+      // Set 'after' for the next iteration to fetch the next page, if available
+      after = paging?.next?.after || null;
+      hasMore = Boolean(after);
+    } catch (error) {
+      console.error('Error fetching meetings:', error);
+      hasMore = false;
+    }
+  }
+
+  account.lastPulledDates.meetings = now;
+  await saveDomain(domain);
+};
+
+async function getMeetingAttendeesEmail(meetingId) {
+  try {
+    // Fetch associated contacts for the meeting
+    const response = await hubspotClient.apiRequest({
+      method: 'post',
+      path: '/crm/v3/associations/MEETINGS/CONTACTS/batch/read',
+      body: { inputs: [{ id: meetingId }] }
+    });
+
+    const meetingAssociationsResults = (await response.json())?.results || [];
+
+    // Transform the results into a map of meetingId to contactIds
+    const meetingAssociations = meetingAssociationsResults.reduce((acc, assoc) => {
+      if (assoc.from) {
+        acc[assoc.from.id] = assoc.to.map(contact => contact.id);
+      }
+      return acc;
+    }, {});
+
+    const contactIds = Object.values(meetingAssociations).flat();
+
+    // Fetch details for each contact
+    const contacts = await Promise.all(contactIds.map(async (contactId) => {
+      const { properties } = await hubspotClient.crm.contacts.basicApi.getById(contactId, ['email']);
+      return properties.email;
+    }));
+
+    return contacts;
+  } catch (error) {
+    console.error('Error fetching meeting contacts:', error);
+    return [];
+  }
+}
+
 const pullDataFromHubspot = async () => {
   console.log('start pulling data from HubSpot');
 
@@ -317,6 +429,17 @@ const pullDataFromHubspot = async () => {
     } catch (err) {
       console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processCompanies', hubId: account.hubId } });
     }
+
+    // Schedule the processMeetings function to run once a day
+    cron.schedule('0 0 * * *', async () => {
+      console.log('Running processMeetings at midnight');
+      try {
+        await processMeetings(domain, account.hubId, q);
+        console.log('process meetings');
+      } catch (err) {
+        console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processMeetings', hubId: account.hubId } });
+      }
+    });
 
     try {
       await drainQueue(domain, actions, q);
